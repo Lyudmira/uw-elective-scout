@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+# Generated output files (not source code)
+*_classification.json
+*_classification.md
+*_schedule_classification.json
+*_schedule_classification.md
+*_uwu_conflict_classification.json
+*_uwu_conflict_classification.md
