@@ -43,7 +43,11 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 BASE_URL = "https://uwaterloocm.kuali.co/api/v1/catalog"
 CATALOG_PAGE_URL = "https://uwaterloo.ca/academic-calendar/undergraduate-studies/catalog"
+UWFLOW_GRAPHQL_URL = "https://uwflow.com/graphql"
 TERM_ORDER = {"1A": 1, "1B": 2, "2A": 3, "2B": 4, "3A": 5, "3B": 6, "4A": 7, "4B": 8}
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+}
 
 
 @dataclass(frozen=True)
@@ -94,16 +98,76 @@ class MeetingBlock:
     label: str
 
 
+@dataclass(frozen=True)
+class UWFlowStats:
+    easy: int | None
+    useful: int | None
+
+
 def fetch_json(url: str) -> dict | list:
     last_error: Exception | None = None
     for _ in range(2):
         try:
-            with urllib.request.urlopen(url, timeout=20) as response:
+            request = urllib.request.Request(url, headers=HTTP_HEADERS)
+            with urllib.request.urlopen(request, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8", "ignore"))
         except Exception as error:  # pragma: no cover - network retry path
             last_error = error
     assert last_error is not None
     raise last_error
+
+
+def post_json(url: str, payload: dict) -> dict | list:
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={**HTTP_HEADERS, "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8", "ignore"))
+        except Exception as error:  # pragma: no cover - network retry path
+            last_error = error
+    assert last_error is not None
+    raise last_error
+
+
+def fetch_uwflow_stats(code: str) -> UWFlowStats:
+    try:
+        response = post_json(
+            UWFLOW_GRAPHQL_URL,
+            {
+                "query": "query CourseStats($code: String!) { course_search_index(where: {code: {_eq: $code}}) { easy useful } }",
+                "variables": {"code": code.lower().replace(" ", "")},
+            },
+        )
+    except Exception:
+        return UWFlowStats(easy=None, useful=None)
+
+    rows = response.get("data", {}).get("course_search_index", []) if isinstance(response, dict) else []
+    if not rows:
+        return UWFlowStats(easy=None, useful=None)
+
+    row = rows[0]
+
+    def to_percent(value: object) -> int | None:
+        if not isinstance(value, (int, float)):
+            return None
+        return int(round(float(value) * 100))
+
+    return UWFlowStats(
+        easy=to_percent(row.get("easy")),
+        useful=to_percent(row.get("useful")),
+    )
+
+
+def format_uwflow_stats(stats: UWFlowStats) -> str:
+    easy = "n/a" if stats.easy is None else f"{stats.easy}%"
+    useful = "n/a" if stats.useful is None else f"{stats.useful}%"
+    return f"easy {easy} | useful {useful}"
 
 
 def resolve_catalog_id() -> str:
@@ -260,19 +324,22 @@ def child_tags(tag: _Element, name: str | None = None) -> list[_Element]:
 
 def leaf_rank(tag: _Element, required_rank_by_code: dict[str, int], allowed_markers: list[str]) -> int:
     text = normalize_text(tag.get_text(" ", strip=True))
+    constraints: list[int] = []
 
     level_match = re.search(r"level\s+([1-4][AB])\s+or\s+higher", text, re.I)
     if level_match:
-        return TERM_ORDER[level_match.group(1).upper()]
+        constraints.append(TERM_ORDER[level_match.group(1).upper()])
 
-    level_match = re.search(r"level\s+([1-4][AB])", text, re.I)
-    if level_match:
-        return TERM_ORDER[level_match.group(1).upper()]
+    elif re.search(r"level\s+([1-4][AB])", text, re.I):
+        level_match = re.search(r"level\s+([1-4][AB])", text, re.I)
+        assert level_match is not None
+        constraints.append(TERM_ORDER[level_match.group(1).upper()])
 
     if "Enrolled in" in text or "enrolled in" in text:
         if any(marker in text for marker in allowed_markers):
-            return 0
-        return 99
+            constraints.append(0)
+        else:
+            return 99
 
     codes = re.findall(r"\b[A-Z]{2,5}\d{3}[A-Z]?\b", text)
     if codes:
@@ -289,12 +356,17 @@ def leaf_rank(tag: _Element, required_rank_by_code: dict[str, int], allowed_mark
             ]
         ):
             known_ranks = [rank for rank in ranks if rank != 99]
-            return min(known_ranks) if known_ranks else 99
-        if any(rank == 99 for rank in ranks):
-            return 99
-        return max(ranks) if ranks else 0
+            constraints.append(min(known_ranks) if known_ranks else 99)
+        else:
+            if any(rank == 99 for rank in ranks):
+                return 99
+            constraints.append(max(ranks) if ranks else 0)
 
-    return 0
+    if not constraints:
+        return 0
+    if any(rank == 99 for rank in constraints):
+        return 99
+    return max(constraints)
 
 
 def parse_rule(tag: _Element, required_rank_by_code: dict[str, int], allowed_markers: list[str]) -> int:
@@ -872,6 +944,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-prefix", default=None, help="Prefix for output filenames (default: derived from program name)")
     parser.add_argument("--report", action="store_true", help="Write classification and schedule files to disk")
     parser.add_argument("--verbose", action="store_true", help="Show course names in terminal output (default: codes only)")
+    parser.add_argument("--uwflow", action="store_true", help="Show UW Flow easy/useful scores next to each terminal-listed course")
     # Schedule
     parser.add_argument("--schedule-term", help="Waterloo schedule term number or named alias")
     parser.add_argument("--allowed-marker", action="append", dest="allowed_markers", help="Additional prerequisite enrollment marker to treat as satisfied")
@@ -1438,12 +1511,22 @@ def main() -> None:
         if any(bool(section_row.get("is_online")) for section_row in r.section_rows)
     ]
     no_conflict_items = [item for item in conflict_records if item["conflict_status"] == "no conflict"]
+    uwflow_cache: dict[str, UWFlowStats] = {}
+
+    def get_uwflow_stats(code: str) -> UWFlowStats:
+        if code not in uwflow_cache:
+            uwflow_cache[code] = fetch_uwflow_stats(code)
+        return uwflow_cache[code]
 
     print(f"\nEligible electives \u2014 {term_display_name(schedule_term)}")
 
     print(f"\nonline ({len(online_records)}):")
     if online_records:
-        if args.verbose:
+        if args.uwflow:
+            for r in sorted(online_records, key=lambda r: r.code):
+                base = f"  {r.code} - {r.title}" if args.verbose else f"  {r.code}"
+                print(f"{base} | {format_uwflow_stats(get_uwflow_stats(r.code))}")
+        elif args.verbose:
             for r in sorted(online_records, key=lambda r: r.code):
                 print(f"  {r.code} - {r.title}")
         else:
@@ -1456,7 +1539,11 @@ def main() -> None:
     if student_profile is not None:
         print(f"\nno conflict ({len(no_conflict_items)}):")
         if no_conflict_items:
-            if args.verbose:
+            if args.uwflow:
+                for item in sorted(no_conflict_items, key=lambda x: str(x["code"])):
+                    base = f"  {item['code']} - {item['title']}" if args.verbose else f"  {item['code']}"
+                    print(f"{base} | {format_uwflow_stats(get_uwflow_stats(str(item['code'])))}")
+            elif args.verbose:
                 for item in sorted(no_conflict_items, key=lambda x: str(x["code"])):
                     print(f"  {item['code']} - {item['title']}")
             else:
