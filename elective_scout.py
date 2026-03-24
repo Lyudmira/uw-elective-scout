@@ -41,27 +41,9 @@ except ImportError:  # pragma: no cover - direct script execution fallback
     )
 
 
-DEFAULT_CATALOG_ID = "663290e835aff7001cc62323"
-DEFAULT_PROGRAM_PID = "rkgD1yRAjn"
-DEFAULT_PROGRAM_NAME = "Electrical Engineering (Bachelor of Applied Science - Honours)"
 BASE_URL = "https://uwaterloocm.kuali.co/api/v1/catalog"
+CATALOG_PAGE_URL = "https://uwaterloo.ca/academic-calendar/undergraduate-studies/catalog"
 TERM_ORDER = {"1A": 1, "1B": 2, "2A": 3, "2B": 4, "3A": 5, "3B": 6, "4A": 7, "4B": 8}
-
-DEFAULT_ALLOWED_MARKERS = [
-    "Electrical Engineering",
-    "Computer Engineering",
-    "co-operative program",
-    "BASc program",
-    "Faculty of Engineering",
-    "Faculties of Engineering, Mathematics, or Science",
-    "Engineering program",
-    "Honours Science program",
-    "program offered by the Faculty of Engineering",
-    "program offered by Faculty of Engineering",
-    "program offered by the Faculties of Engineering, Mathematics, or Science",
-    "program offered by an engineering faculty",
-    "program offered by the Faculties of Engineering",
-]
 
 
 @dataclass(frozen=True)
@@ -122,6 +104,41 @@ def fetch_json(url: str) -> dict | list:
             last_error = error
     assert last_error is not None
     raise last_error
+
+
+def resolve_catalog_id() -> str:
+    page = urllib.request.urlopen(CATALOG_PAGE_URL, timeout=20).read().decode("utf-8", "ignore")
+    match = re.search(r"catalogId[\"']?\s*[:=]\s*[\"']([^\"']+)", page, re.I)
+    if not match:
+        raise RuntimeError("Could not determine the active Kuali catalog id from the Waterloo academic calendar page.")
+    return match.group(1)
+
+
+def build_allowed_markers(program_name: str) -> list[str]:
+    markers = {
+        program_name,
+        re.sub(r"\s*\([^)]*\)", "", program_name).strip(),
+        "co-operative program",
+        "BASc program",
+    }
+
+    if "Engineering" in program_name:
+        markers.update(
+            {
+                "Faculty of Engineering",
+                "Faculties of Engineering, Mathematics, or Science",
+                "Engineering program",
+                "program offered by the Faculty of Engineering",
+                "program offered by Faculty of Engineering",
+                "program offered by the Faculties of Engineering, Mathematics, or Science",
+                "program offered by an engineering faculty",
+                "program offered by the Faculties of Engineering",
+            }
+        )
+    if re.search(r"Bachelor of Science|Honours Science|Faculty of Science", program_name):
+        markers.add("Honours Science program")
+
+    return sorted(marker for marker in markers if marker)
 
 
 def normalize_text(text: str) -> str:
@@ -259,12 +276,22 @@ def leaf_rank(tag: _Element, required_rank_by_code: dict[str, int], allowed_mark
 
     codes = re.findall(r"\b[A-Z]{2,5}\d{3}[A-Z]?\b", text)
     if codes:
-        ranks: list[int] = []
-        for code in codes:
-            rank = term_rank_from_code(code, required_rank_by_code)
-            if rank == 99:
-                return 99
-            ranks.append(rank)
+        ranks = [term_rank_from_code(code, required_rank_by_code) for code in codes]
+        if any(
+            marker in text
+            for marker in [
+                "Must have completed at least 1 of the following",
+                "Earned a minimum grade of",
+                "one of the following",
+                "1 of the following",
+                "Choose one of the following",
+                "Choose any of the following",
+            ]
+        ):
+            known_ranks = [rank for rank in ranks if rank != 99]
+            return min(known_ranks) if known_ranks else 99
+        if any(rank == 99 for rank in ranks):
+            return 99
         return max(ranks) if ranks else 0
 
     return 0
@@ -290,12 +317,24 @@ def parse_rule(tag: _Element, required_rank_by_code: dict[str, int], allowed_mar
         if any(
             marker in text
             for marker in [
-                "Complete all of the following",
-                "Must have completed the following",
+                "Must have completed at least 1 of the following",
+                "Earned a minimum grade of",
+                "one of the following",
+                "1 of the following",
+                "Choose one of the following",
                 "Choose any of the following",
                 "Complete one course from this list",
                 "Complete one course from this list or an additional course from List 1",
                 "Complete one course from this list or any additional course from List 1, 2, 3, or 4",
+            ]
+        ):
+            return min(child_ranks) if child_ranks else 0
+
+        if any(
+            marker in text
+            for marker in [
+                "Complete all of the following",
+                "Must have completed the following",
             ]
         ):
             return max(child_ranks) if child_ranks else 0
@@ -493,6 +532,8 @@ def parse_time_days_date(value: str) -> tuple[int, int, tuple[str, ...]] | None:
         return None
 
     days_text = match.group("days") or ""
+    if re.search(r"\d|/", days_text):
+        return None
     days = tuple(re.findall(r"Th|[MTWFS]", days_text))
     if not days:
         return None
@@ -500,6 +541,19 @@ def parse_time_days_date(value: str) -> tuple[int, int, tuple[str, ...]] | None:
     start_hour, start_minute = [int(part) for part in match.group("start").split(":")]
     end_hour, end_minute = [int(part) for part in match.group("end").split(":")]
     return start_hour * 60 + start_minute, end_hour * 60 + end_minute, days
+
+
+def has_meeting_info(value: str) -> bool:
+    text = normalize_text(value)
+    return bool(text and text != "TBA")
+
+
+def split_component_and_section(value: str) -> tuple[str, str | None]:
+    cleaned = normalize_text(value).upper()
+    match = re.fullmatch(r"([A-Z]+)(?:\s+(\d{3}[A-Z]?))?", cleaned)
+    if not match:
+        return cleaned, None
+    return match.group(1), match.group(2)
 
 
 def row_to_blocks(row: ScheduleSectionRow, *, label: str) -> tuple[MeetingBlock, ...]:
@@ -535,11 +589,13 @@ def row_conflict_labels(row: ScheduleSectionRow, occupied_blocks: tuple[MeetingB
 
 
 def is_row_selected(row: ScheduleSectionRow, entry: RegisteredCourseEntry) -> bool:
+    row_component, row_section = split_component_and_section(row.component)
+
     if entry.component is None and entry.class_num is None:
         return True
-    if entry.component is not None and row.component != entry.component:
+    if entry.component is not None and row_component != entry.component:
         return False
-    if entry.class_num is not None and row.class_num != entry.class_num:
+    if entry.class_num is not None and row.class_num != entry.class_num and row_section != entry.class_num:
         return False
     return True
 
@@ -626,7 +682,12 @@ def _score_program(program: dict, query: str) -> int:
 def prompt_program_info() -> tuple[str, str, str]:
     """Interactive fuzzy program search. Returns (catalog_id, program_pid, program_name)."""
     print("Fetching program list…")
-    programs = _fetch_all_programs(DEFAULT_CATALOG_ID)
+    try:
+        catalog_id = resolve_catalog_id()
+        programs = _fetch_all_programs(catalog_id)
+    except Exception:
+        programs = []
+        catalog_id = ""
     if not programs:
         print("Could not fetch program list. Please provide identifiers manually.")
         catalog_id = prompt_non_empty("Catalog ID: ")
@@ -654,7 +715,7 @@ def prompt_program_info() -> tuple[str, str, str]:
         if len(scored) == 1:
             chosen = scored[0]
             print(f"Selected: {chosen['title']}")
-            return DEFAULT_CATALOG_ID, chosen["pid"], chosen["title"]
+            return catalog_id, chosen["pid"], chosen["title"]
 
         top = scored[:10]
         print(f"\n{len(scored)} match(es) found, showing top {len(top)}:")
@@ -669,7 +730,7 @@ def prompt_program_info() -> tuple[str, str, str]:
             idx = int(sel)
             if 1 <= idx <= len(top):
                 chosen = top[idx - 1]
-                return DEFAULT_CATALOG_ID, chosen["pid"], chosen["title"]
+                return catalog_id, chosen["pid"], chosen["title"]
             print(f"Please enter a number between 1 and {len(top)}.")
         elif sel:
             scored2 = sorted(
@@ -683,7 +744,7 @@ def prompt_program_info() -> tuple[str, str, str]:
             if len(scored2) == 1:
                 chosen = scored2[0]
                 print(f"Selected: {chosen['title']}")
-                return DEFAULT_CATALOG_ID, chosen["pid"], chosen["title"]
+                return catalog_id, chosen["pid"], chosen["title"]
             top = scored2[:10]
             print(f"\n{len(scored2)} match(es) found, showing top {len(top)}:")
             for i, p in enumerate(top, 1):
@@ -842,13 +903,114 @@ def prompt_schedule_term() -> str:
             print(str(error))
 
 
+def _describe_section_option(row: ScheduleSectionRow) -> str:
+    _, section = split_component_and_section(row.component)
+    meeting = row.time_days_date or "TBA"
+    location = row.bldg_room or row.camp_loc or "TBA"
+    if row.is_online:
+        location = "ONLINE"
+    section_text = section or "?"
+    return f"section {section_text} | class {row.class_num} | {meeting} | {location} | {row.instructor or 'TBA'}"
+
+
+def _section_family_key(row: ScheduleSectionRow) -> str:
+    component, section = split_component_and_section(row.component)
+    if section and re.fullmatch(r"[0-3]\d\d", section):
+        return section[0]
+    return component
+
+
+def _section_family_label(family_key: str, options: list[ScheduleSectionRow]) -> str:
+    if family_key == "0":
+        return "LEC"
+    if family_key == "1":
+        return "TUT"
+    if family_key == "2":
+        return "LAB"
+    if family_key == "3":
+        components = sorted({row.component for row in options})
+        return "/".join(components) if components else "SEC"
+    components = sorted({split_component_and_section(row.component)[0] for row in options})
+    return "/".join(components) if components else family_key
+
+
+def prompt_required_course_sections(course_codes: tuple[str, ...], term: str) -> tuple[RegisteredCourseEntry, ...]:
+    entries: list[RegisteredCourseEntry] = []
+    if not course_codes:
+        return ()
+
+    print("\nSelect your sections for this term's required courses.")
+    print("Components with no meeting information are skipped.")
+    print("One-off dated components may still be asked so you can identify your actual section.")
+
+    for code in course_codes:
+        subject, cournum = schedule_parse_course(code)
+        html_text = schedule_fetch_schedule("under", term, subject, cournum)
+        if schedule_extract_no_matches(html_text):
+            print(f"\n{code}: no schedule rows were found for {term_display_name(term)}; skipping section prompt.")
+            continue
+
+        _, rows = schedule_extract_section_table(html_text)
+        grouped: dict[str, list[ScheduleSectionRow]] = defaultdict(list)
+        for row in rows:
+            if not has_meeting_info(row.time_days_date):
+                continue
+            grouped[_section_family_key(row)].append(row)
+
+        if not grouped:
+            continue
+
+        print(f"\n{code}")
+        for family_key in sorted(grouped):
+            options = sorted(grouped[family_key], key=lambda row: (row.class_num, row.time_days_date, row.bldg_room))
+            label = _section_family_label(family_key, options)
+
+            if len(options) == 1:
+                chosen = options[0]
+                chosen_component, chosen_section = split_component_and_section(chosen.component)
+                entries.append(
+                    RegisteredCourseEntry(
+                        raw=f"{code} {chosen_component} {chosen_section or chosen.class_num}",
+                        code=code,
+                        component=chosen_component,
+                        class_num=chosen_section or chosen.class_num,
+                    )
+                )
+                print(f"  {code} {label}: using section {chosen_section or chosen.class_num} (only regular weekly option).")
+                continue
+
+            print(f"  {label} options:")
+            for row in options:
+                print(f"    {row.class_num}: {_describe_section_option(row)}")
+
+            family_hint = f"({family_key}xx)" if family_key in {"0", "1", "2", "3"} else ""
+            while True:
+                answer = input(f"  Enter {code} {label} section {family_hint}: ").strip()
+                matches = []
+                for row in options:
+                    _, section = split_component_and_section(row.component)
+                    if section == answer:
+                        matches.append(row)
+                if matches:
+                    chosen = matches[0]
+                    chosen_component, chosen_section = split_component_and_section(chosen.component)
+                    entries.append(
+                        RegisteredCourseEntry(
+                            raw=f"{code} {chosen_component} {chosen_section or chosen.class_num}",
+                            code=code,
+                            component=chosen_component,
+                            class_num=chosen_section or chosen.class_num,
+                        )
+                    )
+                    break
+                print("Please enter one of the listed section numbers.")
+
+    return tuple(entries)
+
+
 def main() -> None:
     args = build_parser().parse_args()
     interactive = not args.non_interactive
-
-    allowed_markers = list(DEFAULT_ALLOWED_MARKERS)
-    if args.allowed_markers:
-        allowed_markers.extend(marker for marker in args.allowed_markers if marker)
 
     # --- STEP 1: Resolve program identity ---
     if args.catalog_id and args.program_pid and args.program_name:
@@ -858,9 +1020,24 @@ def main() -> None:
     elif interactive:
         catalog_id, program_pid, program_name = prompt_program_info()
     else:
-        catalog_id = args.catalog_id or DEFAULT_CATALOG_ID
-        program_pid = args.program_pid or DEFAULT_PROGRAM_PID
-        program_name = args.program_name or DEFAULT_PROGRAM_NAME
+        missing = [
+            name
+            for name, value in (
+                ("--catalog-id", args.catalog_id),
+                ("--program-pid", args.program_pid),
+                ("--program-name", args.program_name),
+            )
+            if not value
+        ]
+        if missing:
+            raise SystemExit("Non-interactive mode requires " + ", ".join(missing) + ".")
+        catalog_id = args.catalog_id
+        program_pid = args.program_pid
+        program_name = args.program_name
+
+    allowed_markers = build_allowed_markers(program_name)
+    if args.allowed_markers:
+        allowed_markers.extend(marker for marker in args.allowed_markers if marker)
 
     output_prefix = args.output_prefix or _slug_from_name(program_name)
 
@@ -894,6 +1071,8 @@ def main() -> None:
                 parse_registered_course_entry(entry)
                 for entry in args.student_completed_courses
             )
+        elif not interactive:
+            completed_elective_entries = ()
         else:
             has_completed = prompt_yes_no(
                 "Have you taken any non-required electives in previous terms? (y/n): "
@@ -906,6 +1085,8 @@ def main() -> None:
                 parse_registered_course_entry(entry)
                 for entry in args.student_registered_courses
             )
+        elif not interactive:
+            registered_entries = ()
         else:
             has_registered = prompt_yes_no(
                 "Have you already registered for any additional courses this term? (y/n): "
@@ -1124,16 +1305,34 @@ def main() -> None:
 
         uwu_records = [record for record in schedule_records if record.campus_group == "UW U"]
 
-        # Automatically derive current-semester required courses from the program data.
-        # Any course whose required rank == student's current standing rank is a course
-        # the student is taking this semester — fetch its schedule to build occupied blocks.
         student_standing_rank = TERM_ORDER.get(student_profile.standing, 0)
-        auto_required_entries = tuple(
-            RegisteredCourseEntry(raw=code, code=code, component=None, class_num=None)
+        auto_required_codes = tuple(
+            code
             for code, rank in required_rank_by_code.items()
             if rank == student_standing_rank
         )
-        all_registered_entries = auto_required_entries + student_profile.registered_entries
+
+        if interactive:
+            auto_required_entries = prompt_required_course_sections(auto_required_codes, schedule_term)
+        else:
+            required_code_set = set(auto_required_codes)
+            provided_code_set = {entry.code for entry in student_profile.registered_entries}
+            missing_required = [code for code in auto_required_codes if code not in provided_code_set]
+            if missing_required:
+                raise SystemExit(
+                    "Non-interactive conflict check requires explicit --student-registered-course entries for all current-term required courses: "
+                    + ", ".join(missing_required)
+                )
+            auto_required_entries = tuple(
+                entry for entry in student_profile.registered_entries
+                if entry.code in required_code_set
+            )
+
+        extra_registered_entries = tuple(
+            entry for entry in student_profile.registered_entries
+            if entry.code not in set(auto_required_codes)
+        )
+        all_registered_entries = auto_required_entries + extra_registered_entries
         occupied_blocks = build_occupied_blocks(all_registered_entries, schedule_term) if all_registered_entries else ()
         conflict_records: list[dict[str, object]] = []
 
@@ -1164,7 +1363,8 @@ def main() -> None:
                             "major_name": student_profile.major_name,
                             "standing": student_profile.standing,
                             "completed_elective_courses": [entry.__dict__ for entry in student_profile.completed_elective_entries],
-                            "registered_courses": [entry.__dict__ for entry in student_profile.registered_entries],
+                            "registered_courses": [entry.__dict__ for entry in extra_registered_entries],
+                            "required_course_sections": [entry.__dict__ for entry in auto_required_entries],
                         },
                         "summary": {
                             "no conflict": sum(1 for item in conflict_records if item["conflict_status"] == "no conflict"),
@@ -1188,11 +1388,14 @@ def main() -> None:
         if student_profile.completed_elective_entries:
             conflict_lines.append("Completed electives: " + ", ".join(e.code for e in student_profile.completed_elective_entries))
         if auto_required_entries:
-            conflict_lines.append("Required courses this term (auto): " + ", ".join(e.code for e in auto_required_entries))
-        if student_profile.registered_entries:
+            conflict_lines.append("Required courses this term: " + ", ".join(
+                f"{e.code} {e.component or ''} {e.class_num or ''}".strip()
+                for e in auto_required_entries
+            ))
+        if extra_registered_entries:
             conflict_lines.append("Additional registered courses: " + ", ".join(
                 f"{e.code}{' ' + e.component if e.component else ''}{' ' + e.class_num if e.class_num else ''}".strip()
-                for e in student_profile.registered_entries
+                for e in extra_registered_entries
             ))
         conflict_lines.append(f"Schedule term: {schedule_term} ({term_display_name(schedule_term)})")
         conflict_lines.append("")
@@ -1230,7 +1433,10 @@ def main() -> None:
             print(f"Wrote {conflict_json_path}")
 
     # --- Terminal summary: eligible electives ---
-    online_records = [r for r in schedule_records if r.campus_group == "online"]
+    online_records = [
+        r for r in schedule_records
+        if any(bool(section_row.get("is_online")) for section_row in r.section_rows)
+    ]
     no_conflict_items = [item for item in conflict_records if item["conflict_status"] == "no conflict"]
 
     print(f"\nEligible electives \u2014 {term_display_name(schedule_term)}")
