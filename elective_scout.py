@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import html
 import json
 import re
 import sys
+import urllib.parse
 import urllib.request
 from urllib.parse import quote
 from collections import Counter, defaultdict
@@ -17,37 +19,37 @@ from typing import Callable
 
 from html.parser import HTMLParser as _HTMLParser
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-try:
-    from classed.uwaterloo_schedule_lookup import (
-        SectionRow as ScheduleSectionRow,
-        default_term as schedule_default_term,
-        extract_no_matches as schedule_extract_no_matches,
-        extract_section_table as schedule_extract_section_table,
-        fetch_schedule as schedule_fetch_schedule,
-        parse_course as schedule_parse_course,
-    )
-except ImportError:  # pragma: no cover - direct script execution fallback
-    from uwaterloo_schedule_lookup import (  # type: ignore
-        SectionRow as ScheduleSectionRow,
-        default_term as schedule_default_term,
-        extract_no_matches as schedule_extract_no_matches,
-        extract_section_table as schedule_extract_section_table,
-        fetch_schedule as schedule_fetch_schedule,
-        parse_course as schedule_parse_course,
-    )
-
 
 BASE_URL = "https://uwaterloocm.kuali.co/api/v1/catalog"
 CATALOG_PAGE_URL = "https://uwaterloo.ca/academic-calendar/undergraduate-studies/catalog"
 UWFLOW_GRAPHQL_URL = "https://uwflow.com/graphql"
+SCHEDULE_BASE_URL = "https://classes.uwaterloo.ca/cgi-bin/cgiwrap/infocour/salook.pl"
 TERM_ORDER = {"1A": 1, "1B": 2, "2A": 3, "2B": 4, "3A": 5, "3B": 6, "4A": 7, "4B": 8}
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 }
+
+
+@dataclass(frozen=True)
+class ScheduleSectionRow:
+    class_num: str
+    component: str
+    camp_loc: str
+    assoc_class: str
+    rel1: str
+    rel2: str
+    enrl_cap: str
+    enrl_tot: str
+    wait_cap: str
+    wait_tot: str
+    time_days_date: str
+    bldg_room: str
+    instructor: str
+
+    @property
+    def is_online(self) -> bool:
+        compact = " ".join([self.camp_loc, self.bldg_room, self.time_days_date, self.instructor]).upper()
+        return "ONLN" in compact or "ONLINE" in compact
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,102 @@ class MeetingBlock:
 class UWFlowStats:
     easy: int | None
     useful: int | None
+
+
+def schedule_parse_course(value: str) -> tuple[str, str]:
+    cleaned = value.strip().upper().replace(" ", "")
+    match = re.fullmatch(r"([A-Z]{2,5})(\d{2,4}[A-Z]?)", cleaned)
+    if not match:
+        raise ValueError(f"invalid course code: {value!r}")
+    return match.group(1), match.group(2)
+
+
+def schedule_default_term() -> str:
+    today = dt.date.today()
+    if today < dt.date(today.year, 4, 1):
+        return f"1{today.year % 100:02d}1"
+    if today < dt.date(today.year, 9, 1):
+        return f"1{today.year % 100:02d}5"
+    return f"1{today.year % 100:02d}9"
+
+
+def schedule_fetch_schedule(level: str, sess: str, subject: str, cournum: str) -> str:
+    payload = urllib.parse.urlencode(
+        {
+            "level": level,
+            "sess": sess,
+            "subject": subject,
+            "cournum": cournum,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(SCHEDULE_BASE_URL, data=payload, headers=HTTP_HEADERS)
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read().decode("utf-8", "ignore")
+
+
+def schedule_extract_no_matches(html_text: str) -> bool:
+    return "Sorry, but your query had no matches." in html_text
+
+
+def schedule_strip_tags(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+
+def schedule_extract_section_table(html_text: str) -> tuple[str, list[ScheduleSectionRow]]:
+    title_match = re.search(
+        r"Your selection was:<BR>\s*Level:\s*(.*?)\s*,\s*Term:\s*(\d+)\s*,\s*Subject:\s*(.*?)\s*,\s*Course Number:\s*(.*?)<P>",
+        html_text,
+        re.S | re.I,
+    )
+    header = ""
+    if title_match:
+        header = f"{schedule_strip_tags(title_match.group(3))} {schedule_strip_tags(title_match.group(4))} (term {title_match.group(2)})"
+
+    rows: list[ScheduleSectionRow] = []
+    table_match = re.search(r"<TABLE BORDER=2>(.*)</TABLE>\s*</TD></TR>\s*<TR><TD COLSPAN = 4></TD></TR>\s*</TABLE>", html_text, re.S | re.I)
+    if not table_match:
+        return header, rows
+
+    table_html = table_match.group(1)
+    row_matches = re.findall(r"<TR>(.*?)</TR>", table_html, re.S | re.I)
+    for raw_row in row_matches:
+        if "<TH>" in raw_row:
+            continue
+        if "COLSPAN=6" in raw_row.upper() or "COLSPAN = 6" in raw_row.upper():
+            continue
+
+        cells = re.findall(r"<TD[^>]*>(.*?)</TD>", raw_row, re.S | re.I)
+        if len(cells) < 12:
+            continue
+
+        values = [schedule_strip_tags(cell).replace("\xa0", " ") for cell in cells[:13]]
+        values = [re.sub(r"\s+", " ", value).strip() for value in values]
+
+        while len(values) < 13:
+            values.append("")
+
+        if not values[0] and not values[1]:
+            continue
+
+        rows.append(
+            ScheduleSectionRow(
+                class_num=values[0],
+                component=values[1],
+                camp_loc=values[2],
+                assoc_class=values[3],
+                rel1=values[4],
+                rel2=values[5],
+                enrl_cap=values[6],
+                enrl_tot=values[7],
+                wait_cap=values[8],
+                wait_tot=values[9],
+                time_days_date=values[10],
+                bldg_room=values[11],
+                instructor=values[12],
+            )
+        )
+
+    return header, rows
 
 
 def fetch_json(url: str) -> dict | list:
