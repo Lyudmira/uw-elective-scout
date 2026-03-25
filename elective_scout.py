@@ -8,6 +8,7 @@ import html
 import json
 import re
 import sys
+import traceback
 import urllib.parse
 import urllib.request
 from urllib.parse import quote
@@ -28,6 +29,7 @@ TERM_ORDER = {"1A": 1, "1B": 2, "2A": 3, "2B": 4, "3A": 5, "3B": 6, "4A": 7, "4B
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 }
+DEBUG_REQUESTS = True
 
 
 @dataclass(frozen=True)
@@ -206,10 +208,12 @@ def fetch_json(url: str) -> dict | list:
     last_error: Exception | None = None
     for _ in range(2):
         try:
+            _debug_print(f"GET {url}")
             request = urllib.request.Request(url, headers=HTTP_HEADERS)
             with urllib.request.urlopen(request, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8", "ignore"))
         except Exception as error:  # pragma: no cover - network retry path
+            _debug_exception(f"GET failed for {url}", error)
             last_error = error
     assert last_error is not None
     raise last_error
@@ -219,6 +223,7 @@ def post_json(url: str, payload: dict) -> dict | list:
     last_error: Exception | None = None
     for _ in range(2):
         try:
+            _debug_print(f"POST {url}")
             request = urllib.request.Request(
                 url,
                 data=json.dumps(payload).encode("utf-8"),
@@ -228,9 +233,24 @@ def post_json(url: str, payload: dict) -> dict | list:
             with urllib.request.urlopen(request, timeout=20) as response:
                 return json.loads(response.read().decode("utf-8", "ignore"))
         except Exception as error:  # pragma: no cover - network retry path
+            _debug_exception(f"POST failed for {url}", error)
             last_error = error
     assert last_error is not None
     raise last_error
+
+
+def _debug_print(message: str) -> None:
+    if DEBUG_REQUESTS:
+        print(f"[debug] {message}", file=sys.stderr)
+
+
+def _debug_exception(label: str, error: BaseException) -> None:
+    if not DEBUG_REQUESTS:
+        return
+    _debug_print(f"{label}: {type(error).__name__}: {error}")
+    tb = traceback.format_exc().rstrip()
+    if tb and tb != "NoneType: None":
+        print(tb, file=sys.stderr)
 
 
 def fetch_uwflow_stats(code: str) -> UWFlowStats:
@@ -853,9 +873,14 @@ def prompt_program_info() -> tuple[str, str, str]:
     """Interactive fuzzy program search. Returns (catalog_id, program_pid, program_name)."""
     print("Fetching program list…")
     try:
+        _debug_print(f"Resolving catalog id from {CATALOG_PAGE_URL}")
         catalog_id = resolve_catalog_id()
+        _debug_print(f"Resolved catalog id: {catalog_id}")
+        _debug_print(f"Fetching programs from {BASE_URL}/programs/{catalog_id}")
         programs = _fetch_all_programs(catalog_id)
-    except Exception:
+        _debug_print(f"Fetched {len(programs)} program records")
+    except Exception as error:
+        _debug_exception("Failed to fetch program list", error)
         programs = []
         catalog_id = ""
     if not programs:
