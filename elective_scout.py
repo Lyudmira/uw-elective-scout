@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import traceback
+import ssl
 import urllib.parse
 import urllib.request
 from urllib.parse import quote
@@ -30,6 +31,32 @@ HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
 }
 DEBUG_REQUESTS = True
+
+
+def build_ssl_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    if sys.platform == "win32" and hasattr(ssl, "enum_certificates"):
+        added = 0
+        try:
+            for store_name in ("ROOT", "CA"):
+                for cert, encoding, trust in ssl.enum_certificates(store_name):  # type: ignore[attr-defined]
+                    if encoding != "x509_asn":
+                        continue
+                    if trust and ssl.Purpose.SERVER_AUTH not in trust:
+                        continue
+                    try:
+                        pem = ssl.DER_cert_to_PEM_cert(cert)
+                        context.load_verify_locations(cadata=pem)
+                        added += 1
+                    except Exception:
+                        continue
+            _debug_print(f"Loaded {added} Windows system certificates into SSL context")
+        except Exception as error:
+            _debug_exception("Failed to load Windows system certificates", error)
+    return context
+
+
+SSL_CONTEXT = build_ssl_context()
 
 
 @dataclass(frozen=True)
@@ -135,7 +162,7 @@ def schedule_fetch_schedule(level: str, sess: str, subject: str, cournum: str) -
         }
     ).encode("utf-8")
     request = urllib.request.Request(SCHEDULE_BASE_URL, data=payload, headers=HTTP_HEADERS)
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=20, context=SSL_CONTEXT) as response:
         return response.read().decode("utf-8", "ignore")
 
 
@@ -210,7 +237,7 @@ def fetch_json(url: str) -> dict | list:
         try:
             _debug_print(f"GET {url}")
             request = urllib.request.Request(url, headers=HTTP_HEADERS)
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=20, context=SSL_CONTEXT) as response:
                 return json.loads(response.read().decode("utf-8", "ignore"))
         except Exception as error:  # pragma: no cover - network retry path
             _debug_exception(f"GET failed for {url}", error)
@@ -230,7 +257,7 @@ def post_json(url: str, payload: dict) -> dict | list:
                 headers={**HTTP_HEADERS, "Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=20, context=SSL_CONTEXT) as response:
                 return json.loads(response.read().decode("utf-8", "ignore"))
         except Exception as error:  # pragma: no cover - network retry path
             _debug_exception(f"POST failed for {url}", error)
@@ -289,7 +316,8 @@ def format_uwflow_stats(stats: UWFlowStats) -> str:
 
 
 def resolve_catalog_id() -> str:
-    page = urllib.request.urlopen(CATALOG_PAGE_URL, timeout=20).read().decode("utf-8", "ignore")
+    request = urllib.request.Request(CATALOG_PAGE_URL, headers=HTTP_HEADERS)
+    page = urllib.request.urlopen(request, timeout=20, context=SSL_CONTEXT).read().decode("utf-8", "ignore")
     match = re.search(r"catalogId[\"']?\s*[:=]\s*[\"']([^\"']+)", page, re.I)
     if not match:
         raise RuntimeError("Could not determine the active Kuali catalog id from the Waterloo academic calendar page.")
