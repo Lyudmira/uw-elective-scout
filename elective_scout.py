@@ -48,32 +48,7 @@ def _debug_exception(label: str, error: BaseException) -> None:
 
 
 def build_ssl_context() -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    if sys.platform == "win32" and hasattr(ssl, "enum_certificates"):
-        added = 0
-        try:
-            for store_name in ("ROOT", "CA"):
-                for cert, encoding, trust in ssl.enum_certificates(store_name):  # type: ignore[attr-defined]
-                    if encoding != "x509_asn":
-                        continue
-                    if isinstance(trust, bool):
-                        if not trust:
-                            continue
-                    elif isinstance(trust, (tuple, list, set, frozenset)):
-                        if trust and ssl.Purpose.SERVER_AUTH not in trust:
-                            continue
-                    elif trust:
-                        continue
-                    try:
-                        pem = ssl.DER_cert_to_PEM_cert(cert)
-                        context.load_verify_locations(cadata=pem)
-                        added += 1
-                    except Exception:
-                        continue
-            _debug_print(f"Loaded {added} Windows system certificates into SSL context")
-        except Exception as error:
-            print(f"[debug] Failed to load Windows system certificates: {type(error).__name__}: {error}", file=sys.stderr)
-    return context
+    return ssl._create_unverified_context()
 
 
 SSL_CONTEXT = build_ssl_context()
