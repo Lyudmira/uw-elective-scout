@@ -33,6 +33,20 @@ HTTP_HEADERS = {
 DEBUG_REQUESTS = True
 
 
+def _debug_print(message: str) -> None:
+    if DEBUG_REQUESTS:
+        print(f"[debug] {message}", file=sys.stderr)
+
+
+def _debug_exception(label: str, error: BaseException) -> None:
+    if not DEBUG_REQUESTS:
+        return
+    _debug_print(f"{label}: {type(error).__name__}: {error}")
+    tb = traceback.format_exc().rstrip()
+    if tb and tb != "NoneType: None":
+        print(tb, file=sys.stderr)
+
+
 def build_ssl_context() -> ssl.SSLContext:
     context = ssl.create_default_context()
     if sys.platform == "win32" and hasattr(ssl, "enum_certificates"):
@@ -42,7 +56,13 @@ def build_ssl_context() -> ssl.SSLContext:
                 for cert, encoding, trust in ssl.enum_certificates(store_name):  # type: ignore[attr-defined]
                     if encoding != "x509_asn":
                         continue
-                    if trust and ssl.Purpose.SERVER_AUTH not in trust:
+                    if isinstance(trust, bool):
+                        if not trust:
+                            continue
+                    elif isinstance(trust, (tuple, list, set, frozenset)):
+                        if trust and ssl.Purpose.SERVER_AUTH not in trust:
+                            continue
+                    elif trust:
                         continue
                     try:
                         pem = ssl.DER_cert_to_PEM_cert(cert)
@@ -52,7 +72,7 @@ def build_ssl_context() -> ssl.SSLContext:
                         continue
             _debug_print(f"Loaded {added} Windows system certificates into SSL context")
         except Exception as error:
-            _debug_exception("Failed to load Windows system certificates", error)
+            print(f"[debug] Failed to load Windows system certificates: {type(error).__name__}: {error}", file=sys.stderr)
     return context
 
 
@@ -264,20 +284,6 @@ def post_json(url: str, payload: dict) -> dict | list:
             last_error = error
     assert last_error is not None
     raise last_error
-
-
-def _debug_print(message: str) -> None:
-    if DEBUG_REQUESTS:
-        print(f"[debug] {message}", file=sys.stderr)
-
-
-def _debug_exception(label: str, error: BaseException) -> None:
-    if not DEBUG_REQUESTS:
-        return
-    _debug_print(f"{label}: {type(error).__name__}: {error}")
-    tb = traceback.format_exc().rstrip()
-    if tb and tb != "NoneType: None":
-        print(tb, file=sys.stderr)
 
 
 def fetch_uwflow_stats(code: str) -> UWFlowStats:
